@@ -1,2 +1,2 @@
-# gru_ard
-GRU with Variational Dropout
+# RNN ARD
+GRU/LSTM with Variational Dropout
