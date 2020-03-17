@@ -1,6 +1,5 @@
 import math
 import torch
-import torch.nn.functional as F
 
 
 from .varropout import LinearVD
@@ -61,8 +60,10 @@ class RNNCell(torch.nn.Module):
             self.n_weights = 3
 
 
-        self.linear_ih = LinearVD(input_size, hidden_size, bias=bias)
-        self.linear_hh = LinearVD(hidden_size, hidden_size, bias=bias)
+        self.linear_ih = LinearVD(input_size, self.n_weights * hidden_size,
+                                  bias=bias)
+        self.linear_hh = LinearVD(hidden_size, self.n_weights * hidden_size,
+                                  bias=bias)
 
     def reset_parameters(self):
         # stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -85,37 +86,46 @@ class RNNLayer(torch.nn.Module):
         self.cell = cell(*cell_args, **cell_kwargs)
 
     def forward(self, inputs, hidden_state):
+        hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
+        seq_len = inputs.shape[1]
+
         outputs = []
-        for i in range(len(inputs)):
-            out, hidden_state = self.cell(inputs[i], hidden_state)
+        for i in range(seq_len):
+            out, hidden_state = self.cell(inputs[:, i], hidden_state)
             outputs += [out]
-        return torch.stack(outputs), hidden_state
+        return torch.stack(outputs, dim=1), hidden_state
 
 
 class ReverseRNNLayer(RNNLayer):
     def forward(self, inputs, hidden_state):
+        hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
+        seq_len = inputs.shape[1]
+
         outputs = []
-        for i in reversed(range(len(inputs))):
-            out, hidden_state = self.cell(inputs[i], hidden_state)
+        for i in reversed(range(seq_len)):
+            out, hidden_state = self.cell(inputs[:, i], hidden_state)
             outputs += [out]
-        return torch.stack(outputs), hidden_state
+        return torch.stack(outputs, dim=1), hidden_state
 
 
 class BidirRNNLayer(torch.nn.Module):
     def __init__(self, cell, *cell_args, **cell_kwargs):
         super().__init__()
-        self.cells = torch.nn.ModuleList([
+        self.layers = torch.nn.ModuleList([
             RNNLayer(cell, *cell_args, **cell_kwargs),
             ReverseRNNLayer(cell, *cell_args, **cell_kwargs)
         ])
 
     def forward(self, inputs, hidden_state):
+        hidden_state = hidden_state.reshape(
+                2, -1, self.layers[0].cell.hidden_size)
+
         outputs = []
         output_hidden_states = torch.empty_like(hidden_state)
 
-        for i, cell in enumerate(self.cells):
+        for i, layer in enumerate(self.layers):
             state = hidden_state[i]
-            out, out_state = cell(inputs, state)
+            out, out_state = layer(inputs, state)
             outputs += [out]
             output_hidden_states[i] = out_state
 
@@ -123,11 +133,10 @@ class BidirRNNLayer(torch.nn.Module):
 
 
 class GRUCell(RNNCell):
-    def __init__(self, input_size, hidden_size):
-        super().__init__('GRU', input_size, hidden_size)
+    def __init__(self, input_size, hidden_size, bias):
+        super().__init__('GRU', input_size, hidden_size, bias)
 
     def forward(self, input, hidden_state):
-
         # update dropout noise
         if self.training:
             self.linear_ih.update_weight_noise()
@@ -139,34 +148,42 @@ class GRUCell(RNNCell):
         rx, zx, nx = gates_input.chunk(self.n_weights, 1)
         rh, zh, nh = gates_hidden.chunk(self.n_weights, 1)
 
-        r = F.sigmoid(rx + rh)
-        z = F.sigmoid(zx + zh)
-        n = F.tanh(nx + r * nh)
+        r = torch.sigmoid(rx + rh)
+        z = torch.sigmoid(zx + zh)
+        n = torch.tanh(nx + r * nh)
 
         hidden_state = (1 - z) * n + z * hidden_state
         return hidden_state, hidden_state
 
+
 class GRU(RNNBase):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        cell_args = (self.input_size, self.hidden_size, self.bias)
+        super().__init__('GRU', *args, **kwargs)
+        first_cell_args = (self.input_size, self.hidden_size, self.bias)
+        other_cell_args = (self.hidden_size * self.n_dirs, self.hidden_size,
+                           self.bias)
         layer = BidirRNNLayer if self.bidirectional else RNNLayer
-        self.layers = torch.nn.ModuleList([
-            layer(GRUCell, *cell_args) for _ in range(self.num_layers)
-        ])
-        self.n_dirs = self.bidirectional + 1
+        self.layers = torch.nn.ModuleList(
+            [layer(GRUCell, *first_cell_args)] +
+            [layer(GRUCell, *other_cell_args)
+             for _ in range(self.num_layers - 1)]
+        )
 
     def _init_hidden_state(self, inputs):
         batch_size = len(inputs)
         hidden_state = torch.zeros(
-                self.num_layers, self.n_dirs, batch_size, self.hidden_size,
+                self.num_layers * self.n_dirs, batch_size, self.hidden_size,
                 dtype=inputs.dtype, device=inputs.device
         )
+
         return hidden_state
 
     def forward(self, inputs, hidden_state=None):
         if hidden_state is None:
             hidden_state = self._init_hidden_state(inputs)
+
+        hidden_state = hidden_state.reshape(self.num_layers, self.n_dirs,
+                                            -1, self.hidden_size)
 
         output_states = torch.empty_like(hidden_state)
         output = inputs
@@ -176,4 +193,5 @@ class GRU(RNNBase):
             output, out_state = rnn_layer(output, state)
             output_states[i] = out_state
 
-        return output, output_states
+        return output, output_states.reshape(self.num_layers * self.n_dirs,
+                                             -1, self.hidden_size)
