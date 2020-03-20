@@ -1,9 +1,9 @@
 import torch
 import torch.nn.functional as F
-from cplxmodule.relevance import LinearARD
+from cplxmodule.nn.relevance import LinearVD
 
 
-class LinearVD(LinearARD):
+class LinearVD(LinearVD):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.register_buffer('weight_noisy', torch.zeros_like(self.weight))

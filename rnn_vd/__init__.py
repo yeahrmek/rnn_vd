@@ -1,1 +1,1 @@
-from .rnn import GRU
+from .rnn import GRUVD
