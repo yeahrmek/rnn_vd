@@ -1,6 +1,6 @@
-import math
 import torch
 
+from cplxmodule.nn.masked import LinearMasked
 
 from .vardropout import LinearVD
 
@@ -28,25 +28,6 @@ class RNNBase(torch.nn.Module):
         for m in self.modules():
             m.reset_parameters()
 
-    def _init_hidden_state(self, inputs):
-        raise NotImplementedError
-
-    def forward(self, inputs, hidden_state=None):
-        raise NotImplementedError
-
-    def from_module(self, rnn_module):
-        """
-        Load weights from usual GRU/LSTM module
-
-        Args:
-            state_dict: dict
-                State dictionary of the GRU/LSTM model
-
-        Returns:
-
-        """
-        raise NotImplementedError
-
 
 class BaseCell(torch.nn.Module):
     def __init__(self, mode, input_size, hidden_size, bias, linear):
@@ -67,6 +48,9 @@ class BaseCell(torch.nn.Module):
 
         self.reset_parameters()
 
+    def forward(self, *args, **kwargs):
+        pass
+
     def reset_parameters(self):
         for name, weight in self.named_parameters():
             if 'linear_hh.bias' in name:
@@ -76,14 +60,43 @@ class BaseCell(torch.nn.Module):
                     weight.data[self.hidden_size:self.hidden_size * 2] = 1
 
 
-class RNNCell(BaseCell):
-    def __init__(self, mode, input_size, hidden_size, bias=True):
-        super().__init__(mode, input_size, hidden_size, bias, torch.nn.Linear)
+class GRUCellMixin(object):
+    def forward(self, input, hidden_state):
+        gates_input = self.linear_ih(input)
+        gates_hidden = self.linear_hh(hidden_state)
+        
+        rx, zx, nx = gates_input.chunk(self.n_weights, 1)
+        rh, zh, nh = gates_hidden.chunk(self.n_weights, 1)
+        
+        r = torch.sigmoid(rx + rh)
+        z = torch.sigmoid(zx + zh)
+        n = torch.tanh(nx + r * nh)
+        
+        hidden_state = (hidden_state - n) * z + n
+        return hidden_state, hidden_state
+        
+
+class GRUCell(GRUCellMixin, BaseCell):
+    def __init__(self, input_size, hidden_size, bias):
+        super().__init__('GRU', input_size, hidden_size, bias, torch.nn.Linear)
 
 
-class RNNVDCell(BaseCell):
-    def __init__(self, mode, input_size, hidden_size, bias=True):
-        super().__init__(mode, input_size, hidden_size, bias, LinearVD)
+class GRUVDCell(GRUCellMixin, BaseCell):
+    def __init__(self, input_size, hidden_size, bias):
+        super().__init__('GRU', input_size, hidden_size, bias, LinearVD)
+
+    def forward(self, input, hidden_state):
+        # update dropout noise
+        if self.training:
+            self.linear_ih.update_weight_noise()
+            self.linear_hh.update_weight_noise()
+
+        return super().forward(input, hidden_state)
+
+
+class GRUMaskedCell(GRUCellMixin, BaseCell):
+    def __init__(self, input_size, hidden_size, bias):
+        super().__init__('GRU', input_size, hidden_size, bias, LinearMasked)
 
 
 class RNNLayer(torch.nn.Module):
@@ -94,7 +107,7 @@ class RNNLayer(torch.nn.Module):
     def forward(self, inputs, hidden_state):
         hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
         seq_len = inputs.shape[1]
-
+    
         outputs = []
         for i in range(seq_len):
             out, hidden_state = self.cell(inputs[:, i], hidden_state)
@@ -106,7 +119,7 @@ class ReverseRNNLayer(RNNLayer):
     def forward(self, inputs, hidden_state):
         hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
         seq_len = inputs.shape[1]
-
+    
         outputs = []
         for i in range(seq_len - 1, -1, -1):
             out, hidden_state = self.cell(inputs[:, i], hidden_state)
@@ -122,77 +135,22 @@ class BidirRNNLayer(torch.nn.Module):
 
     def forward(self, inputs, hidden_state):
         hidden_state = hidden_state.reshape(
-                2, -1, self.straight.cell.hidden_size)
-
+            2, -1, self.straight.cell.hidden_size)
+    
         output_hidden_states = torch.empty_like(hidden_state)
-
+    
         state = hidden_state[0]
         out, output_hidden_states[0] = self.straight(inputs, state)
         outputs = [out]
-
+    
         state = hidden_state[1]
         out, output_hidden_states[1] = self.reverse(inputs, state)
         outputs += [out]
-
+    
         return torch.cat(outputs, -1), output_hidden_states
 
 
-class GRUCell(RNNCell):
-    def __init__(self, input_size, hidden_size, bias):
-        super().__init__('GRU', input_size, hidden_size, bias)
-
-    def forward(self, input, hidden_state):
-        gates_input = self.linear_ih(input)
-        gates_hidden = self.linear_hh(hidden_state)
-
-        rx, zx, nx = gates_input.chunk(self.n_weights, 1)
-        rh, zh, nh = gates_hidden.chunk(self.n_weights, 1)
-
-        r = torch.sigmoid(rx + rh)
-        z = torch.sigmoid(zx + zh)
-        n = torch.tanh(nx + r * nh)
-
-        hidden_state = (hidden_state - n) * z + n
-        return hidden_state, hidden_state
-
-
-class GRUVDCell(RNNVDCell):
-    def __init__(self, input_size, hidden_size, bias):
-        super().__init__('GRU', input_size, hidden_size, bias)
-
-    def forward(self, input, hidden_state):
-        # update dropout noise
-        if self.training:
-            self.linear_ih.update_weight_noise()
-            self.linear_hh.update_weight_noise()
-
-        gates_input = self.linear_ih(input)
-        gates_hidden = self.linear_hh(hidden_state)
-
-        rx, zx, nx = gates_input.chunk(self.n_weights, 1)
-        rh, zh, nh = gates_hidden.chunk(self.n_weights, 1)
-
-        r = torch.sigmoid(rx + rh)
-        z = torch.sigmoid(zx + zh)
-        n = torch.tanh(nx + r * nh)
-
-        hidden_state = (hidden_state - n) * z + n
-        return hidden_state, hidden_state
-
-
-class GRUVD(RNNBase):
-    def __init__(self, *args, **kwargs):
-        super().__init__('GRU', *args, **kwargs)
-        first_cell_args = (self.input_size, self.hidden_size, self.bias)
-        other_cell_args = (self.hidden_size * self.n_dirs, self.hidden_size,
-                           self.bias)
-        layer = BidirRNNLayer if self.bidirectional else RNNLayer
-        self.layers = torch.nn.ModuleList(
-                [layer(GRUVDCell, *first_cell_args)] +
-                [layer(GRUVDCell, *other_cell_args)
-             for _ in range(self.num_layers - 1)]
-        )
-
+class GRUMixin(object):
     def _init_hidden_state(self, inputs):
         batch_size = len(inputs)
         hidden_state = torch.zeros(
@@ -260,3 +218,31 @@ class GRUVD(RNNBase):
         )
 
         return self.load_state_dict(state_dict, strict=False)
+
+
+class GRUVD(GRUMixin, RNNBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__('GRU', *args, **kwargs)
+        first_cell_args = (self.input_size, self.hidden_size, self.bias)
+        other_cell_args = (self.hidden_size * self.n_dirs, self.hidden_size,
+                           self.bias)
+        layer = BidirRNNLayer if self.bidirectional else RNNLayer
+        self.layers = torch.nn.ModuleList(
+                [layer(GRUVDCell, *first_cell_args)] +
+                [layer(GRUVDCell, *other_cell_args)
+             for _ in range(self.num_layers - 1)]
+        )
+
+
+class GRUMasked(GRUMixin, RNNBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__('GRU', *args, **kwargs)
+        first_cell_args = (self.input_size, self.hidden_size, self.bias)
+        other_cell_args = (self.hidden_size * self.n_dirs, self.hidden_size,
+                           self.bias)
+        layer = BidirRNNLayer if self.bidirectional else RNNLayer
+        self.layers = torch.nn.ModuleList(
+                [layer(GRUMaskedCell, *first_cell_args)] +
+                [layer(GRUMaskedCell, *other_cell_args)
+             for _ in range(self.num_layers - 1)]
+        )
