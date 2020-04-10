@@ -97,6 +97,13 @@ class GeneralDotProductScore(DotProductScore):
         return score
 
 
+class MultiheadAttention(torch.nn.MultiheadAttention):
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        
+        self._qkv_same_embed_dim = state['_qkv_same_embed_dim']
+
+
 class TransformerEncoderLayer(torch.nn.Module):
     r"""This is a fork of the `torch.nn.TransformerEncoderLayer` with
     additional parameters `kdim` and `vdim`.
@@ -106,9 +113,8 @@ class TransformerEncoderLayer(torch.nn.Module):
                  dim_feedforward=2048, dropout=0.1, activation="relu",
                  linear=torch.nn.Linear):
         super().__init__()
-        self.self_attn = torch.nn.MultiheadAttention(
+        self.self_attn = MultiheadAttention(
             d_model, nhead, kdim=kdim, vdim=vdim, dropout=dropout)
-        
         # Implementation of Feedforward model
         self.linear1 = linear(d_model, dim_feedforward)
         self.dropout = torch.nn.Dropout(dropout)
@@ -122,19 +128,18 @@ class TransformerEncoderLayer(torch.nn.Module):
         self.activation = _get_activation_fn(activation)
 
     def __setstate__(self, state):
+        
         if 'activation' not in state:
             state['activation'] = F.relu
-        super(TransformerEncoderLayer, self).__setstate__(state)
+        super().__setstate__(state)
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         # type: (Tensor, Optional[Tensor], Optional[Tensor]) -> Tensor
         r"""Pass the input through the encoder layer.
-
         Args:
             src: the sequence to the encoder layer (required).
             src_mask: the mask for the src sequence (optional).
             src_key_padding_mask: the mask for the src keys per batch (optional).
-
         Shape:
             see the docs in Transformer class.
         """
