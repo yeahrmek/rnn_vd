@@ -1,1 +1,1 @@
-from .rnn import GRUVD, GRUMasked
+from .rnn import GRU, GRUVD, GRUMasked

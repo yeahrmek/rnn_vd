@@ -1,3 +1,4 @@
+import math
 import torch
 
 from cplxmodule.nn.masked import LinearMasked
@@ -5,7 +6,7 @@ from cplxmodule.nn.masked import LinearMasked
 from .vardropout import LinearVD
 
 
-class RNNBase(torch.nn.Module):
+class BaseRNN(torch.nn.Module):
     def __init__(self, mode, input_size, hidden_size,
                  num_layers=1, bias=True, batch_first=False,
                  dropout=0., bidirectional=False):
@@ -85,13 +86,13 @@ class GRUVDCell(GRUCellMixin, BaseCell):
     def __init__(self, input_size, hidden_size, bias):
         super().__init__('GRU', input_size, hidden_size, bias, LinearVD)
 
-    def forward(self, input, hidden_state):
+    def forward(self, input, hidden_state, **kwargs):
         # update dropout noise
         if self.training:
             self.linear_ih.update_weight_noise()
             self.linear_hh.update_weight_noise()
 
-        return super().forward(input, hidden_state)
+        return super().forward(input, hidden_state, **kwargs)
 
 
 class GRUMaskedCell(GRUCellMixin, BaseCell):
@@ -104,7 +105,7 @@ class RNNLayer(torch.nn.Module):
         super().__init__()
         self.cell = cell(*cell_args, **cell_kwargs)
 
-    def forward(self, inputs, hidden_state):
+    def forward(self, inputs, hidden_state, **kwargs):
         hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
         seq_len = inputs.shape[1]
     
@@ -116,14 +117,50 @@ class RNNLayer(torch.nn.Module):
 
 
 class ReverseRNNLayer(RNNLayer):
-    def forward(self, inputs, hidden_state):
+    def forward(self, inputs, hidden_state, chunk_len=None, chunk_stride=None):
+        """
+        Forward pass of ReverseRNN layer. The sequence in split into small
+        sequences of `chunk_len` size, for each such sequence the
+        hidden state is reset to zeros (except the first one).
+        The sequences are enumerate from the tail of the original sequence
+        
+        Args:
+            inputs : torch.Tensor, shape=(batch, seq_len, features)
+            
+            hidden_state:
+            
+            chunk_len : int or None
+                Length of sequence to split the original sequence to
+
+        Returns:
+
+        """
         hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
         seq_len = inputs.shape[1]
     
+        if chunk_len is None:
+            chunk_len = seq_len
+        if chunk_stride is None:
+            chunk_stride = chunk_len
+            
+        n_chunks = int(math.ceil(seq_len / chunk_stride))
+    
         outputs = []
-        for i in range(seq_len - 1, -1, -1):
-            out, hidden_state = self.cell(inputs[:, i], hidden_state)
-            outputs += [out]
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * chunk_stride
+            end = min((chunk_idx + 1) * chunk_len, seq_len)
+
+            idx_to_append = list(range(start, start + chunk_stride))
+            if chunk_idx == n_chunks - 1:
+                idx_to_append = list(range(start, end))
+            
+            hidden_state = torch.zeros_like(hidden_state)
+            
+            for i in range(end - 1, start - 1, -1):
+                out, hidden_state = self.cell(inputs[:, i], hidden_state)
+                if i in idx_to_append:
+                    outputs += [out]
+                
         return torch.stack(outputs[::-1], dim=1), hidden_state
 
 
@@ -133,7 +170,7 @@ class BidirRNNLayer(torch.nn.Module):
         self.straight = RNNLayer(cell, *cell_args, **cell_kwargs)
         self.reverse = ReverseRNNLayer(cell, *cell_args, **cell_kwargs)
 
-    def forward(self, inputs, hidden_state):
+    def forward(self, inputs, hidden_state, chunk_len, chunk_stride):
         hidden_state = hidden_state.reshape(
             2, -1, self.straight.cell.hidden_size)
     
@@ -144,7 +181,8 @@ class BidirRNNLayer(torch.nn.Module):
         outputs = [out]
     
         state = hidden_state[1]
-        out, output_hidden_states[1] = self.reverse(inputs, state)
+        out, output_hidden_states[1] = self.reverse(inputs, state, chunk_len,
+                                                    chunk_stride)
         outputs += [out]
     
         return torch.cat(outputs, -1), output_hidden_states
@@ -160,7 +198,7 @@ class GRUMixin(object):
 
         return hidden_state
 
-    def forward(self, inputs, hidden_state=None):
+    def forward(self, inputs, hidden_state=None, **kwargs):
         if hidden_state is None:
             hidden_state = self._init_hidden_state(inputs)
 
@@ -172,7 +210,7 @@ class GRUMixin(object):
 
         for i, rnn_layer in enumerate(self.layers):
             state = hidden_state[i]
-            output, out_state = rnn_layer(output, state)
+            output, out_state = rnn_layer(output, state, **kwargs)
             output_states[i] = out_state
 
         return output, output_states.reshape(self.num_layers * self.n_dirs,
@@ -220,7 +258,21 @@ class GRUMixin(object):
         return self.load_state_dict(state_dict, strict=False)
 
 
-class GRUVD(GRUMixin, RNNBase):
+class GRU(GRUMixin, BaseRNN):
+    def __init__(self, *args, **kwargs):
+        super().__init__('GRU', *args, **kwargs)
+        first_cell_args = (self.input_size, self.hidden_size, self.bias)
+        other_cell_args = (self.hidden_size * self.n_dirs, self.hidden_size,
+                           self.bias)
+        layer = BidirRNNLayer if self.bidirectional else RNNLayer
+        self.layers = torch.nn.ModuleList(
+                [layer(GRUCell, *first_cell_args)] +
+                [layer(GRUCell, *other_cell_args)
+             for _ in range(self.num_layers - 1)]
+        )
+
+
+class GRUVD(GRUMixin, BaseRNN):
     def __init__(self, *args, **kwargs):
         super().__init__('GRU', *args, **kwargs)
         first_cell_args = (self.input_size, self.hidden_size, self.bias)
@@ -234,7 +286,7 @@ class GRUVD(GRUMixin, RNNBase):
         )
 
 
-class GRUMasked(GRUMixin, RNNBase):
+class GRUMasked(GRUMixin, BaseRNN):
     def __init__(self, *args, **kwargs):
         super().__init__('GRU', *args, **kwargs)
         first_cell_args = (self.input_size, self.hidden_size, self.bias)
