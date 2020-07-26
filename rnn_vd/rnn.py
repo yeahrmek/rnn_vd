@@ -43,6 +43,8 @@ class BaseRNN(torch.nn.Module):
         for m in self.modules():
             m.reset_parameters()
 
+
+class RNNMixin(object):
     def _init_hidden_state(self, inputs):
         batch_size = len(inputs)
         hidden_state = torch.zeros(
@@ -53,25 +55,38 @@ class BaseRNN(torch.nn.Module):
         return hidden_state
 
     def forward(self, inputs, hidden_state=None, **kwargs):
-        if hidden_state is None:
-            hidden_state = self._init_hidden_state(inputs)
+        """
 
-        hidden_state = hidden_state.reshape(self.num_layers, self.n_dirs,
-                                            -1, self.hidden_size)
+        Parameters:
+        -----------
+        inputs : torch.Tensor
+            Input tensor
 
-        output_states = torch.empty_like(hidden_state)
+        hidden_state : list[torch.Tensor], shape=(n_dirs, batch_size, h_size)
+            List of hidden states for each layer
+
+        **kwargs:
+
+        Returns:
+
+        """
+        output_states = []
         output = inputs
 
-        for i, rnn_layer in enumerate(self.layers):
-            state = hidden_state[i]
-            output, out_state = rnn_layer(output, state, **kwargs)
+        for i, layer in enumerate(self.layers):
+            if hidden_state is None:
+                h_size = layer.straight.cell.hidden_size if isinstance(
+                        layer, BidirRNNLayer) else layer.cell.hidden_size
+                state = torch.zeros(self.n_dirs, len(inputs), h_size,
+                                    dtype=inputs.dtype, device=inputs.device)
+            else:
+                state = hidden_state[i]
+            output, out_state = layer(output, state, **kwargs)
             if i < self.num_layers - 1 and self.dropout > 0:
                 output = self.dropout_layer(output)
-            output_states[i] = out_state
+            output_states.append(out_state)
 
-        return output, output_states.reshape(self.num_layers * self.n_dirs,
-                                             -1, self.hidden_size)
-
+        return output, output_states
 
 
 class BaseCell(torch.nn.Module):
@@ -249,16 +264,16 @@ class BidirRNNLayer(torch.nn.Module):
         return torch.cat(outputs, -1), output_hidden_states
 
 
-class GRU(BaseRNN):
+class GRU(RNNMixin, BaseRNN):
     def __init__(self, *args, **kwargs):
         super().__init__(GRUCell, *args, **kwargs)
 
 
-class GRUVD(BaseRNN):
+class GRUVD(RNNMixin, BaseRNN):
     def __init__(self, *args, **kwargs):
         super().__init__(GRUVDCell, *args, **kwargs)
 
 
-class GRUMasked(BaseRNN):
+class GRUMasked(RNNMixin, BaseRNN):
     def __init__(self, *args, **kwargs):
         super().__init__(GRUMaskedCell, *args, **kwargs)
