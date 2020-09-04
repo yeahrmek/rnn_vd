@@ -1,5 +1,6 @@
 import math
 import torch
+from collections import deque
 
 from cplxmodule.nn.masked import LinearMasked
 
@@ -29,7 +30,7 @@ class BaseRNN(torch.nn.Module):
         first_cell_args = (input_size, hidden_size, bias, activation)
         other_cell_args = (hidden_size * self.n_dirs, hidden_size, bias,
                            activation)
-        
+
         layer = BidirRNNLayer if bidirectional else RNNLayer
         self.layers = torch.nn.ModuleList(
                 [layer(cell, *first_cell_args, **kwargs)] +
@@ -48,7 +49,7 @@ class RNNMixin(object):
     def _init_hidden_state(self, inputs):
         batch_size = len(inputs)
         hidden_state = torch.zeros(
-                self.num_layers * self.n_dirs, batch_size, self.hidden_size,
+                self.num_layers, self.n_dirs, batch_size, self.hidden_size,
                 dtype=inputs.dtype, device=inputs.device
         )
 
@@ -73,15 +74,11 @@ class RNNMixin(object):
         output_states = []
         output = inputs
 
+        if hidden_state is None:
+            hidden_state = self._init_hidden_state(inputs).unsqueeze(2)
+
         for i, layer in enumerate(self.layers):
-            if hidden_state is None:
-                h_size = layer.straight.cell.hidden_size if isinstance(
-                        layer, BidirRNNLayer) else layer.cell.hidden_size
-                state = torch.zeros(self.n_dirs, len(inputs), h_size,
-                                    dtype=inputs.dtype, device=inputs.device)
-            else:
-                state = hidden_state[i]
-            output, out_state = layer(output, state, **kwargs)
+            output, out_state = layer(output, hidden_state[i], **kwargs)
             if i < self.num_layers - 1 and self.dropout > 0:
                 output = self.dropout_layer(output)
             output_states.append(out_state)
@@ -97,11 +94,15 @@ class BaseCell(torch.nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.layernorm = layernorm
-        
+
         if mode == 'LSTM':
             self.n_weights = 4
         elif mode == 'GRU':
             self.n_weights = 3
+
+            # these are needed to save gates in forward_hook
+            self.reset_gate = torch.nn.Sigmoid()
+            self.update_gate = torch.nn.Sigmoid()
 
         self.linear_ih = linear(
                 input_size, self.n_weights * hidden_size, bias=bias)
@@ -131,21 +132,21 @@ class GRUCellMixin(object):
     def forward(self, input, hidden_state):
         gates_input = self.linear_ih(input)
         gates_hidden = self.linear_hh(hidden_state)
-        
+
         if self.layernorm:
             gates_input = self.layernorm_ih(gates_input)
             gates_hidden = self.layernorm_ih(gates_hidden)
-        
+
         rx, zx, nx = gates_input.chunk(self.n_weights, 1)
         rh, zh, nh = gates_hidden.chunk(self.n_weights, 1)
-        
-        r = torch.sigmoid(rx + rh)
-        z = torch.sigmoid(zx + zh)
+
+        r = self.reset_gate(rx + rh)
+        z = self.update_gate(zx + zh)
         n = self.activation(nx + r * nh)
-        
+
         hidden_state = (hidden_state - n) * z + n
         return hidden_state, hidden_state
-        
+
 
 class GRUCell(GRUCellMixin, BaseCell):
     def __init__(self, input_size, hidden_size, bias,
@@ -180,16 +181,35 @@ class RNNLayer(torch.nn.Module):
     def __init__(self, cell, *cell_args, **cell_kwargs):
         super().__init__()
         self.cell = cell(*cell_args, **cell_kwargs)
-
+        
     def forward(self, inputs, hidden_state, **kwargs):
-        hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
+        delay = 1 if hidden_state.ndim < 3 else hidden_state.shape[1]
+        hidden_state = hidden_state.reshape(delay, -1, self.cell.hidden_size)
+        h = deque(torch.unbind(hidden_state, dim=0))
+
         seq_len = inputs.shape[1]
-    
+
         outputs = []
         for i in range(seq_len):
-            out, hidden_state = self.cell(inputs[:, i], hidden_state)
+            # taking k-th value - doesn't work
+            out, h_new = self.cell(inputs[:, i], h[0])
+
+            # # averaging - doesn't work (works worse than taking k-th value
+            # out, h_new = self.cell(inputs[:, i], sum(h) / len(h))
+
+            # # weighted averaging -
+            # weights = [1.0 / (j + 1) for j in range(len(h))]
+            # weights = [w / sum(weights) for w in weights]
+            # out, h_new = self.cell(inputs[:, i],
+            #                        sum(h[j] * weights[j] for j in range(len(h))))
+
             outputs += [out]
-        return torch.stack(outputs, dim=1), hidden_state
+            h.append(h_new)
+            h.popleft()
+
+
+
+        return torch.stack(outputs, dim=1), torch.stack(tuple(h), dim=0)
 
 
 class ReverseRNNLayer(RNNLayer):
@@ -199,12 +219,12 @@ class ReverseRNNLayer(RNNLayer):
         sequences of `chunk_len` size, for each such sequence the
         hidden state is reset to zeros (except the first one).
         The sequences are enumerate from the tail of the original sequence
-        
+
         Args:
             inputs : torch.Tensor, shape=(batch, seq_len, features)
-            
+
             hidden_state:
-            
+
             chunk_len : int or None
                 Length of sequence to split the original sequence to
 
@@ -213,14 +233,14 @@ class ReverseRNNLayer(RNNLayer):
         """
         hidden_state = hidden_state.reshape(-1, self.cell.hidden_size)
         seq_len = inputs.shape[1]
-    
+
         if chunk_len is None:
             chunk_len = seq_len
         if chunk_stride is None:
             chunk_stride = chunk_len
-            
+
         n_chunks = int(math.ceil(seq_len / chunk_stride))
-    
+
         outputs = []
         for chunk_idx in range(n_chunks):
             start = chunk_idx * chunk_stride
@@ -229,14 +249,14 @@ class ReverseRNNLayer(RNNLayer):
             idx_to_append = list(range(start, start + chunk_stride))
             if chunk_idx == n_chunks - 1:
                 idx_to_append = list(range(start, end))
-            
+
             hidden_state = torch.zeros_like(hidden_state)
-            
+
             for i in range(end - 1, start - 1, -1):
                 out, hidden_state = self.cell(inputs[:, i], hidden_state)
                 if i in idx_to_append:
                     outputs += [out]
-        
+
         return torch.stack(outputs[::-1], dim=1), hidden_state
 
 
@@ -249,18 +269,18 @@ class BidirRNNLayer(torch.nn.Module):
     def forward(self, inputs, hidden_state, chunk_len, chunk_stride):
         hidden_state = hidden_state.reshape(
             2, -1, self.straight.cell.hidden_size)
-    
+
         output_hidden_states = torch.empty_like(hidden_state)
-    
+
         state = hidden_state[0]
         out, output_hidden_states[0] = self.straight(inputs, state)
         outputs = [out]
-    
+
         state = hidden_state[1]
         out, output_hidden_states[1] = self.reverse(inputs, state, chunk_len,
                                                     chunk_stride)
         outputs += [out]
-    
+
         return torch.cat(outputs, -1), output_hidden_states
 
 
