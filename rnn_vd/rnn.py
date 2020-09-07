@@ -1,7 +1,7 @@
 import math
-import torch
 from collections import deque
 
+import torch
 from cplxmodule.nn.masked import LinearMasked
 
 from .vardropout import LinearVD

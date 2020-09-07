@@ -1,10 +1,10 @@
 import math
-import torch
 
+import torch
 from cplxmodule.nn.masked import LinearMasked
 
-from .vardropout import LinearVD
 from .rnn import RNNLayer, BidirRNNLayer
+from .vardropout import LinearVD
 
 
 class BaseDummyCell(torch.nn.Module):
