@@ -181,7 +181,7 @@ class RNNLayer(torch.nn.Module):
     def __init__(self, cell, *cell_args, **cell_kwargs):
         super().__init__()
         self.cell = cell(*cell_args, **cell_kwargs)
-        
+
     def forward(self, inputs, hidden_state, **kwargs):
         delay = 1 if hidden_state.ndim < 3 else hidden_state.shape[1]
         hidden_state = hidden_state.reshape(delay, -1, self.cell.hidden_size)
@@ -239,7 +239,7 @@ class ReverseRNNLayer(RNNLayer):
         if chunk_stride is None:
             chunk_stride = chunk_len
 
-        n_chunks = int(math.ceil(seq_len / chunk_stride))
+        n_chunks = int(math.ceil((seq_len - chunk_len) / chunk_stride) + 1)
 
         outputs = []
         for chunk_idx in range(n_chunks):
